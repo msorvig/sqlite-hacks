@@ -50,7 +50,8 @@ typedef struct FileWriter FileWriter;
 ** thread handle. SorterThread.bDone is set to 1 (to indicate to the main
 ** thread that joining SorterThread.pThread will not block) before the thread
 ** exits. SorterThread.pThread and bDone are always cleared after the 
-** background thread has been joined.
+** background thread has been joined.  The bDone field is informational only.
+** It is never actually used, except inside of assert() statements.
 **
 ** One object (specifically, VdbeSorter.aThread[SorterThread.nThread-1])
 ** is reserved for the foreground thread.
