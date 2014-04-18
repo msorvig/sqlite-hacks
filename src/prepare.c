@@ -14,6 +14,7 @@
 ** from disk.
 */
 #include "sqliteInt.h"
+#include "math.h"
 
 /*
 ** Fill the InitData structure with an error message that indicates
@@ -698,6 +699,260 @@ end_prepare:
   assert( (rc&db->errMask)==rc );
   return rc;
 }
+
+void trimWhiteSpace(const char **pzBegin, int *pnLength)
+{
+    while (*pnLength > 0 && sqlite3Isspace(**pzBegin)) {
+         ++(*pzBegin);
+         --(*pnLength);
+    }
+    while (*pnLength > 0 && sqlite3Isspace(*(*pzBegin + *pnLength - 1)))
+        --(*pnLength);
+}
+
+int findTermPointers(const char *zBegin, const char *zEnd, char  **terms, int *termsLength, const int nMaxTerms)
+{
+    const char *zPos = zBegin;
+    int iCount = 0;
+    while (zPos < zEnd && iCount < nMaxTerms) {
+        char *zTermEnd = strstr(zPos + 1, ",");
+        if (!zTermEnd || zTermEnd > zEnd)
+            zTermEnd = zEnd;
+
+
+        char *zTermStart = zPos;
+        int nTermLength = zTermEnd - zPos;
+        trimWhiteSpace(&zTermStart, &nTermLength);
+        terms[iCount] = zTermStart;
+        termsLength[iCount] = nTermLength;
+
+        ++iCount;
+        zPos = zTermEnd + 1;
+    }
+    return iCount;
+}
+
+void printTerms(char **terms, int *termsLength, int count)
+{
+    for (int i = 0; i < count; ++i) {
+        int len = 500;
+        const char *buf[len];
+        memset(buf, 0, len);
+        strncpy(buf, terms[i], termsLength[i]);
+        buf[termsLength[i]] = 0;
+        printf("term %d %d \"%s\" \n", terms[i], termsLength[i], buf);
+    }
+}
+
+void printSubstring(const char *string, int count)
+{
+    int len = 500;
+    const char *buf[len];
+    memset(buf, 0, len);
+    strncpy(buf, string, count);
+    printf("%s\n", buf);
+}
+
+unsigned int nextTerms(unsigned int terms, int termCount, bool isRollup)
+{
+    //  Initial condition
+    if (terms == -1) {
+        terms = 0;
+        return terms;
+    }
+
+    if (isRollup) {
+        // Set next bit to roll up another term.
+        terms = terms * 2 + 1;
+    } else {
+        // Power set series for CUBE.
+        ++terms;
+    }
+
+    // Stop condition.
+    if (terms >= pow(2, termCount))
+        terms = -1;
+    return terms;
+}
+
+void appendQuery(char *buffer, int *offset, const char *str)
+{
+    strcpy(buffer + *offset, str);
+    (*offset) += strlen(str);
+}
+
+void appendQueryL(char *buffer, int *offset, const char *str, int len)
+{
+    strncpy(buffer + *offset, str, len);
+    (*offset) += len;
+}
+
+void eraseQuery(char *buffer, int *offset, int len)
+{
+    (*offset) -= len;
+}
+
+#define TEST_BIT(var,pos) ((var) & (1<<(pos)))
+
+/*
+** Add support for GROUP BY ROLLUP and GROUP BY CUBE
+** by rewriting the sql statment in terms of multiple
+** GRUP BY queries combined with UNION ALL.
+**
+** This function expects a SQL query of the form
+**
+** SELECT a, b       sum(z) FROM table GROUP BY ROLLUP(a, b) [...]
+**
+** which will be rewritten to:
+**
+** SELECT a, b,       sum(z) FROM table GROUP BY (a, b) [...] UNION ALL
+** SELECT a, null,    sum(z) FROM table GROUP BY (a) [...] UNION ALL
+** SELECT null, null, sum(z) FROM table GROUP BY (null) [...] UNION ALL
+**
+** CUBE is similar
+**
+** SELECT null, b,    sum(z) FROM table GROUP BY (b) [...] UNION ALL
+**
+*/
+static int sqlite3RewriteHack(
+    sqlite3 *db,              /* The database on which the SQL executes */
+    const char *zSql,         /* UTF-8 encoded SQL statement. */
+    int nBytes,               /* Length of zSql in bytes. */
+    const char **pzSql,       /* OUT: The rewritten SQL */
+    int *pnBytes              /* OUT: Length of pzSql in bytes */
+){
+    const int nMaxLen = 10000;
+    const int nMaxTerms = 30;
+
+    // Scan the SQL statement for required query tokens.
+    const char *zSelectToken = "SELECT ";
+    const char *zFromToken = "FROM ";
+    const char *zGroupByRollupToken = "GROUP BY ROLLUP(";
+    const char *zGroupByCubeToken = "GROUP BY CUBE(";
+    int iSelectLen = strlen(zSelectToken);
+    int iFromLen = strlen(zFromToken);
+    int iGroupByRollupLen = strlen(zGroupByRollupToken);
+    int iGroupByCubeLen = strlen(zGroupByCubeToken);
+    const char *zSelect = zSql ? strstr(zSql, zSelectToken) : 0;
+    const char *zFrom = zSelect ? strstr(zSelect, zFromToken) : 0;
+    const char *zGroupByRollup = zFrom ? strstr(zFrom, zGroupByRollupToken) : 0;
+    const char *zGroupByCube = zFrom ? strstr(zFrom, zGroupByCubeToken) : 0;
+    const char *zGroupBy = zGroupByRollup ? zGroupByRollup : zGroupByCube;
+    int iGroupByLen = zGroupByRollup ? iGroupByRollupLen : iGroupByCubeLen;
+    const char *zGroupByEnd = zGroupBy ? strstr(zGroupBy, ")") : 0;
+
+    // Bail out if we don't have a valid ROLLUP or CUBE query.
+    if (!zSelect || !zFrom || !zGroupBy || (!zGroupByRollup && !zGroupByCube)|| !zGroupByEnd) {
+        *pzSql = zSql;
+        *pnBytes = nBytes;
+        return 1;
+    }
+
+    // Find "select" terms (between SELECT and FROM)
+    char *pzSelectTerms[nMaxTerms];
+    int nSelectTermsLength[nMaxTerms];
+    const int nSelectTermCount = findTermPointers(zSelect + iSelectLen, zFrom, pzSelectTerms, nSelectTermsLength, nMaxTerms);
+
+    // Find table name after FROM
+    const char *pzTableName = zFrom + iFromLen;
+    int iTableNameLen = zGroupBy - pzTableName;
+
+    // Find "group by" terms (between GROUP BY ROLLUP/CUBE and group by end)
+    char *pzGroupByTerms[nMaxTerms];
+    int nGroupByTermsLength[nMaxTerms];
+    const int nGroupByTermCount = findTermPointers(zGroupBy + iGroupByLen, zGroupByEnd, pzGroupByTerms, nGroupByTermsLength, nMaxTerms);
+
+    // Match select and group by terms for later lookup
+    int nSelectTermGroupByIndex[nMaxTerms];
+    for (int i = 0; i < nSelectTermCount; ++i) {
+        nSelectTermGroupByIndex[i] = -1;
+        for (int j = 0; j < nGroupByTermCount; ++j) {
+            if (strncmp(pzSelectTerms[i], pzGroupByTerms[j], nSelectTermsLength[i]) == 0)
+                nSelectTermGroupByIndex[i] = j;
+        }
+    }
+
+    // Build the new (rewritten) query
+    char *zSqlRewritten = sqlite3Malloc(nMaxLen);
+    int nPos = 0;
+
+    // New Tokens
+    const char *zUnionAllToken = " UNION ALL ";
+    int nUnionAllLen = strlen(zUnionAllToken);
+    const char *zGroupByToken = " GROUP BY ";
+    int nGroupByLen = strlen(zGroupByToken);
+
+    // Build and append GROUP BY/UNION ALL subqueries
+    unsigned int terms = -1;
+    while (true) {
+        bool isRollup = (zGroupByRollup != 0);
+        terms = nextTerms(terms, nGroupByTermCount, isRollup);
+        if (terms == -1)
+            break;
+
+        // Append "SELECT" and select terms in original query order. Replace rolled-up terms with "null".
+        appendQuery(zSqlRewritten, &nPos, zSelectToken);
+        for (int i = 0; i < nSelectTermCount; ++i) {
+            int rollupIndex = nSelectTermGroupByIndex[i];
+            if (rollupIndex == -1) {
+                appendQueryL(zSqlRewritten, &nPos, pzSelectTerms[i], nSelectTermsLength[i]);
+            } else {
+                int reversePosition = nGroupByTermCount - i - 1;
+                bool rollup = TEST_BIT(terms, reversePosition);
+                if (rollup) {
+                    appendQuery(zSqlRewritten, &nPos, "null");
+                } else {
+                    appendQueryL(zSqlRewritten, &nPos, pzSelectTerms[i], nSelectTermsLength[i]);
+                }
+            }
+            appendQuery(zSqlRewritten, &nPos, ", ");
+        }
+        eraseQuery(zSqlRewritten, &nPos, 2); // remove last ","
+
+        // Append "FROM" and table name
+        appendQuery(zSqlRewritten, &nPos, " ");
+        appendQuery(zSqlRewritten, &nPos, zFromToken);
+        appendQueryL(zSqlRewritten, &nPos, pzTableName, iTableNameLen);
+
+        // Append "GROUP BY" and group by terms in original query order. Roll up terms in reverse order.
+        appendQuery(zSqlRewritten, &nPos, zGroupByToken);
+        bool addedTerm = false;
+        for (int i = 0; i < nGroupByTermCount; ++i) {
+            int reversePosition = nGroupByTermCount - i - 1;
+            bool rollup = TEST_BIT(terms, reversePosition);
+            if (!rollup) {
+                appendQueryL(zSqlRewritten, &nPos, pzGroupByTerms[i], nGroupByTermsLength[i]);
+                appendQuery(zSqlRewritten, &nPos, ", ");
+                addedTerm = true;
+            }
+        }
+        if (addedTerm)
+            eraseQuery(zSqlRewritten, &nPos, 2); // remove last ","
+        else
+            appendQuery(zSqlRewritten, &nPos, "null"); // "GROUP BY null" instead of "GROUP BY <blank>"
+
+        appendQuery(zSqlRewritten, &nPos, zUnionAllToken);
+
+        appendQuery(zSqlRewritten, &nPos, "\n"); // debug
+    }
+    eraseQuery(zSqlRewritten, &nPos, nUnionAllLen);
+    appendQuery(zSqlRewritten, &nPos, ";");
+
+//    printf("Rewritten sql\n%s\n", zSqlRewritten);
+
+    *pzSql = zSqlRewritten;
+    *pnBytes = nBytes;
+    return 0;
+}
+
+int sqlite3RewriteHackFinalize(
+        sqlite3 *db,                /* The database on which the SQL executes */
+        char *zSql            /* The new rewritten SQL */
+){
+    sqlite3_free(zSql);
+    return 0;
+}
+
 static int sqlite3LockAndPrepare(
   sqlite3 *db,              /* Database handle. */
   const char *zSql,         /* UTF-8 encoded SQL statement. */
@@ -708,6 +963,10 @@ static int sqlite3LockAndPrepare(
   const char **pzTail       /* OUT: End of parsed string */
 ){
   int rc;
+  const char *zSqlRewritten;
+  int nBytesRewritten;
+  bool bDidRewrite;
+
   assert( ppStmt!=0 );
   *ppStmt = 0;
   if( !sqlite3SafetyCheckOk(db) ){
@@ -715,11 +974,18 @@ static int sqlite3LockAndPrepare(
   }
   sqlite3_mutex_enter(db->mutex);
   sqlite3BtreeEnterAll(db);
-  rc = sqlite3Prepare(db, zSql, nBytes, saveSqlFlag, pOld, ppStmt, pzTail);
+
+  rc = sqlite3RewriteHack(db, zSql, nBytes, &zSqlRewritten, &nBytesRewritten);
+  bDidRewrite = (rc == 0);
+
+  rc = sqlite3Prepare(db, zSqlRewritten, nBytesRewritten, saveSqlFlag, pOld, ppStmt, pzTail);
   if( rc==SQLITE_SCHEMA ){
     sqlite3_finalize(*ppStmt);
-    rc = sqlite3Prepare(db, zSql, nBytes, saveSqlFlag, pOld, ppStmt, pzTail);
+    rc = sqlite3Prepare(db, zSqlRewritten, nBytesRewritten, saveSqlFlag, pOld, ppStmt, pzTail);
   }
+
+  if (bDidRewrite)
+    sqlite3RewriteHackFinalize(db, zSqlRewritten);
   sqlite3BtreeLeaveAll(db);
   sqlite3_mutex_leave(db->mutex);
   assert( rc==SQLITE_OK || *ppStmt==0 );

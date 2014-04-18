@@ -1,3 +1,47 @@
+<h1 align="center">Sqlite-hacks</h1>
+
+Sqlite with modifications:
+
+#### Support for GROUP BY ROLLUP / GROUP BY CUBE (Status: Hack)
+
+Implemented by rewriting the SQL query string during the prepare query phase.
+
+Given a "Sales" table with Year, Month, Day, and Amount columns. The following query
+
+```
+    SELECT Year, Month, sum(Amount) FROM Sales GROUP BY ROLLUP(Year, Month);
+```
+
+  is rewritten into
+
+```
+    SELECT Year, Month, sum(Amount) FROM Sales GROUP BY (Year, Month)  UNION ALL
+    SELECT Year, null,  sum(Amount) FROM Sales GROUP BY (Year)         UNION ALL
+    SELECT null, null,  sum(Amount) FROM Sales GROUP BY (null)         UNION ALL
+```
+
+  and returns (say)
+
+```
+    2011|3|25
+    2012|3|25
+    2012|4|25
+    2012|5|25
+    2011| |25
+    2012| |75
+        | |100
+```
+
+  In addition, GROUP BY CUBE summarises all months:
+
+```
+       |3|50
+       |4|25
+       |5|25
+```
+
+Now, on to the regular README:
+
 <h1 align="center">SQLite Source Repository</h1>
 
 This repository contains the complete source code for the SQLite database
